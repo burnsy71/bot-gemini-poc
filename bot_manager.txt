@@ -1,0 +1,109 @@
+import subprocess
+import threading
+import os
+from pathlib import Path
+from typing import Dict
+from fastapi import HTTPException
+
+# Define paths
+BASE_DIR = Path(__file__).resolve().parent
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+# Bot Definitions
+BOT_CONFIGS = {
+    "bot-1": {
+        "name": "HFT Arb",
+        "cmd": ["python3", "-u", "jup_multi_async_arb.py"], # -u for unbuffered output
+        "log_file": LOG_DIR / "bot_hft.log",
+        "cwd": BASE_DIR
+    },
+    "bot-2": {
+        "name": "Sniper",
+        "cmd": ["python3", "-u", "sniper_monitor.py"],
+        "log_file": LOG_DIR / "bot_sniper.log",
+        "cwd": BASE_DIR
+    },
+    "bot-3": {
+        "name": "Maker",
+        "cmd": ["node", "phoenix_maker.js"], 
+        "log_file": LOG_DIR / "maker.log",
+        "cwd": BASE_DIR
+    }
+}
+
+class BotManager:
+    def __init__(self):
+        self.processes: Dict[str, subprocess.Popen] = {}
+        self.lock = threading.Lock()
+
+    def start_bot(self, bot_id: str):
+        if bot_id not in BOT_CONFIGS:
+            raise HTTPException(status_code=404, detail="Bot not found")
+        
+        cfg = BOT_CONFIGS[bot_id]
+        
+        with self.lock:
+            # Check if running
+            if bot_id in self.processes:
+                if self.processes[bot_id].poll() is None:
+                    return {"status": "already_running", "pid": self.processes[bot_id].pid}
+                else:
+                    # Cleanup dead process handle
+                    del self.processes[bot_id]
+
+            # Ensure log file exists
+            log_f = open(cfg["log_file"], "a", encoding="utf-8")
+            
+            try:
+                # Start process
+                p = subprocess.Popen(
+                    cfg["cmd"],
+                    cwd=str(cfg["cwd"]),
+                    stdout=log_f,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True  # Detach from parent
+                )
+                self.processes[bot_id] = p
+                return {"status": "started", "pid": p.pid}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to start: {str(e)}")
+
+    def stop_bot(self, bot_id: str):
+        with self.lock:
+            if bot_id not in self.processes:
+                return {"status": "not_running"}
+            
+            p = self.processes[bot_id]
+            if p.poll() is None:
+                # Nice kill
+                p.terminate()
+                try:
+                    p.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    # Force kill
+                    p.kill()
+            
+            del self.processes[bot_id]
+            return {"status": "stopped"}
+
+    def get_status(self):
+        status_map = {}
+        with self.lock:
+            for bot_id in BOT_CONFIGS:
+                is_running = False
+                if bot_id in self.processes:
+                    if self.processes[bot_id].poll() is None:
+                        is_running = True
+                    else:
+                        del self.processes[bot_id] # Cleanup
+                
+                status_map[bot_id] = {
+                    "id": bot_id,
+                    "status": "active" if is_running else "idle",
+                    "pid": self.processes[bot_id].pid if is_running else None
+                }
+        return status_map
+
+# Create Singleton Instance
+manager = BotManager()

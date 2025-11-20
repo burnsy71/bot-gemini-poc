@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+# High-Margin DEX Sniping Monitor (Phoenix vs AMM)
+
+import os
+import asyncio
+import time
+from typing import Dict, Any, Optional
+
+import aiohttp
+
+# --- Configuration ---
+# Use your current RPC and Keypair setup from .env
+SOL_RPC = os.environ.get("SOL_RPC", "https://api.mainnet-beta.solana.com")
+# Phoenix Market ID for SOL/USDC (Example - Replace with actual ID)
+PHOENIX_MARKET_ID = "4DoNfFBfF7UokCC2FQzriy7yHK6DY6NVdYpuekQ5pRgg" 
+# Jupiter API endpoint for AMM quotes
+JUPITER_QUOTE_URL = "https://api.jup.ag/v6/quote" 
+# Target profit required for execution (The high margin you seek)
+PROFIT_MIN_USD = 1.50
+# Amount of stale order to check against (e.g., $100)
+ORDER_SIZE_USD = 100.00
+# Polling frequency (needs to be very fast)
+POLL_INTERVAL_S = 0.15 
+
+# Token Mint Addresses (USDC and SOL from your existing config)
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+SOL_MINT = "So11111111111111111111111111111111111111112"
+USDC_DEC = 6 # Decimals for calculation
+
+# --- Utility Functions ---
+def log(msg):
+    # Flush ensures the UI receives the log event immediately via the pipe
+    print(msg, flush=True)
+
+def units_to_usd(u: int) -> float: return u / (10 ** USDC_DEC)
+def usd_to_units(usd: float) -> int: return int(round(usd * (10 ** USDC_DEC)))
+
+async def rpc_post(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # Simple RPC wrapper using your existing HTTP session logic
+    # In a production bot, this would use a fast, private RPC endpoint.
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+        try:
+            async with session.post(SOL_RPC, json=payload) as r:
+                if r.status != 200: return None
+                return await r.json()
+        except Exception:
+            return None
+
+async def get_phoenix_top_level(market_id: str) -> Optional[Dict[str, Any]]:
+    # Uses getAccountInfo to read the market account data.
+    # We rely on an SDK to parse the complex data in a real bot, 
+    # but for detection, we simulate reading the book.
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
+        "params": [market_id, {"encoding": "jsonParsed", "commitment": "processed"}]
+    }
+    res = await rpc_post(payload)
+    # The actual Phoenix data structure is complex, but we simulate extracting the top bid/ask.
+    # In reality, you'd use the Phoenix SDK (like in your maker bot) to get the ladder.
+    return res
+
+async def get_jupiter_quote(input_mint: str, output_mint: str, amount_units: int) -> Optional[Dict[str, Any]]:
+    # Gets the best execution price from the AMM side
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount_units),
+        "slippageBps": "50", # Low slippage to get a tight quote
+        "onlyDirectRoutes": "true" # Keep it simple
+    }
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
+        try:
+            async with session.get(JUPITER_QUOTE_URL, params=params) as r:
+                if r.status != 200: return None
+                return await r.json()
+        except Exception:
+            return None
+
+async def monitor_for_opportunity():
+    log(f"Monitoring Phoenix ({PHOENIX_MARKET_ID}) vs Jupiter...")
+    log(f"Targeting: > ${PROFIT_MIN_USD} on a ${ORDER_SIZE_USD} trade.")
+
+    while True:
+        await asyncio.sleep(POLL_INTERVAL_S)
+        
+        # --- 1. Get AMM Price (The True Market Price) ---
+        # We use a small amount to get the best current mid-price (SOL price in USDC)
+        mid_quote = await get_jupiter_quote(SOL_MINT, USDC_MINT, 1000) # 1000 minimum units for a valid quote
+        if not mid_quote or not mid_quote.get('outAmount'): continue
+        
+        # Simulate SOL Price in USDC based on AMM
+        sol_price_amm = int(mid_quote['outAmount']) / 1000000000 # (USDC units / SOL units)
+        
+        # --- 2. Get DEX Order Book Price (The Stale Price) ---
+        phoenix_data = await get_phoenix_top_level(PHOENIX_MARKET_ID)
+        if not phoenix_data: continue
+
+        # SIMULATION: In a real bot, we would parse the Phoenix ladder here.
+        # We simulate the price of the best bid/ask on Phoenix for a small volume.
+        # Assume the stale order is a large, mispriced limit order at the top of the book.
+        
+        # SCENARIO A: STALE SELL (Buy Low on Phoenix)
+        # Stale Price: Phoenix is selling SOL too cheap (best ASK is low)
+        stale_sell_price_usd = sol_price_amm * 0.99 # e.g., 1% below AMM price
+        stale_sell_qty = ORDER_SIZE_USD / stale_sell_price_usd
+
+        # SCENARIO B: STALE BUY (Sell High on Phoenix)
+        # Stale Price: Phoenix is buying SOL too expensive (best BID is high)
+        stale_buy_price_usd = sol_price_amm * 1.01 # e.g., 1% above AMM price
+        stale_buy_qty = ORDER_SIZE_USD / stale_buy_price_usd
+        
+        # --- 3. Check Arbitrage Conditions ---
+        
+        # Condition 1: Buy Stale on Phoenix, Sell on AMM
+        # Buy USD Cost = ORDER_SIZE_USD
+        # Amount Received = ORDER_SIZE_USD / stale_sell_price_usd (in SOL units)
+        # -----------------------------------------------------------------------
+        # Check AMM profit: If we sell the received SOL back to Jupiter, how much USD do we get?
+        amm_sell_quote = await get_jupiter_quote(SOL_MINT, USDC_MINT, int(stale_sell_qty * 10**9)) # Convert to correct SOL units
+        
+        if amm_sell_quote and amm_sell_quote.get('outAmount'):
+            amm_sell_proceeds_usd = units_to_usd(int(amm_sell_quote['outAmount']))
+            profit_usd = amm_sell_proceeds_usd - ORDER_SIZE_USD
+            
+            if profit_usd > PROFIT_MIN_USD:
+                log(f"🚨 OPPORTUNITY: BUY Phoenix @ ${stale_sell_price_usd:.4f}, SELL Jupiter @ ${sol_price_amm:.4f}")
+                log(f"   PROFIT: ${profit_usd:.4f} (Target: ${PROFIT_MIN_USD})")
+                log(f"   ACTION: EXECUTE ATOMIC TX (Buy Phoenix, Sell Jupiter)")
+                # Execute logic goes here (Step 4)
+                await asyncio.sleep(2.0) # Pause to avoid spamming alerts
+                continue
+
+        # Condition 2: Buy on AMM, Sell Stale on Phoenix
+        # Buy USD Cost = ORDER_SIZE_USD
+        # Amount Received = ORDER_SIZE_USD / sol_price_amm (in SOL units)
+        # -----------------------------------------------------------------------
+        # Check Phoenix profit: If we sell the SOL to Phoenix (stale bid), how much USD do we get?
+        
+        # Simulated Phoenix Sell Proceeds
+        phoenix_sell_proceeds_usd = (ORDER_SIZE_USD / sol_price_amm) * stale_buy_price_usd 
+        profit_usd = phoenix_sell_proceeds_usd - ORDER_SIZE_USD
+        
+        if profit_usd > PROFIT_MIN_USD:
+            log(f"🚨 OPPORTUNITY: BUY Jupiter @ ${sol_price_amm:.4f}, SELL Phoenix @ ${stale_buy_price_usd:.4f}")
+            log(f"   PROFIT: ${profit_usd:.4f} (Target: ${PROFIT_MIN_USD})")
+            log(f"   ACTION: EXECUTE ATOMIC TX (Buy Jupiter, Sell Phoenix)")
+            # Execute logic goes here (Step 4)
+            await asyncio.sleep(2.0) # Pause to avoid spamming alerts
+            continue
+
+        
+if __name__ == "__main__":
+    try:
+        asyncio.run(monitor_for_opportunity())
+    except KeyboardInterrupt:
+        log("\nMonitor stopped.")

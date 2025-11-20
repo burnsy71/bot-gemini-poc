@@ -1,0 +1,5 @@
+{
+  "name": "DeFi Arb Command Center",
+  "description": "A high-performance dashboard for monitoring and simulating multi-strategy DeFi arbitrage bots on Solana. Features real-time atomic transaction visualization, HFT volume tracking, and AI-driven market simulation using Gemini.",
+  "requestFramePermissions": []
+}

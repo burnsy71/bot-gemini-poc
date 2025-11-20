@@ -1,0 +1,93 @@
+import time
+import json
+from pathlib import Path
+from typing import Dict, Any
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+# Import modules (Ensure you rename the .txt files to .py!)
+try:
+    from bot_manager import manager, BOT_CONFIGS, LOG_DIR
+    from bot_config import write_env
+except ImportError:
+    print("CRITICAL ERROR: Could not import 'bot_manager' or 'bot_config'.")
+    print("Run this command: mv bot_manager.txt bot_manager.py && mv bot_config.txt bot_config.py")
+    exit(1)
+
+# --- Web Server ---
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/status")
+def get_status():
+    return manager.get_status()
+
+@app.post("/control/{bot_id}/{action}")
+def control_bot(bot_id: str, action: str):
+    if action == "start":
+        return manager.start_bot(bot_id)
+    elif action == "stop":
+        return manager.stop_bot(bot_id)
+    else:
+        raise HTTPException(400, "Invalid action")
+
+@app.get("/logs/{bot_id}")
+def stream_logs(bot_id: str):
+    if bot_id not in BOT_CONFIGS:
+        raise HTTPException(404, "Bot not found")
+    
+    log_file = BOT_CONFIGS[bot_id]["log_file"]
+    
+    def log_generator():
+        # Create file if not exists
+        if not log_file.exists():
+            log_file.touch()
+            
+        with open(log_file, "r", encoding="utf-8") as f:
+            # Read last 2000 bytes for context
+            file_size = log_file.stat().st_size
+            if file_size > 2000:
+                f.seek(file_size - 2000)
+                f.readline() # Skip partial line
+            
+            while True:
+                line = f.readline()
+                if line:
+                    yield f"data: {line.strip()}\n\n"
+                else:
+                    time.sleep(0.2) # Poll interval
+
+    return StreamingResponse(log_generator(), media_type="text/event-stream")
+
+@app.get("/ledger")
+def get_ledger():
+    # Try to read ledger.json from logs
+    ledger_path = LOG_DIR / "ledger.json"
+    if ledger_path.exists():
+        try:
+            with open(ledger_path, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+@app.post("/config")
+def update_config(request: Request, config: Dict[str, Any]):
+    try:
+        write_env(config)
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    print("Starting Bridge Server on port 8010...")
+    uvicorn.run(app, host="127.0.0.1", port=8010)

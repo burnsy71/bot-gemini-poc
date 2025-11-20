@@ -1,0 +1,65 @@
+import os
+from pathlib import Path
+from typing import Dict, Any
+
+# Define paths
+BASE_DIR = Path(__file__).resolve().parent
+ENV_FILE = BASE_DIR / ".env"
+
+def read_env() -> Dict[str, str]:
+    """Reads the .env file and returns a dictionary."""
+    if not ENV_FILE.exists():
+        return {}
+    env_dict = {}
+    with open(ENV_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            env_dict[k.strip()] = v.strip()
+    return env_dict
+
+def write_env(updates: Dict[str, Any]):
+    """Updates the .env file with values from the UI."""
+    current = read_env()
+    
+    # Mapping React config keys to .env keys
+    key_map = {
+        "rpcUrl": "SOL_RPC",
+        "privateKey": "SOL_SK_FILE",
+        "mode": "DRY_RUN" 
+    }
+
+    for ui_key, val in updates.items():
+        if ui_key == "mode":
+            # Convert 'live'/'dry-run' to 0/1
+            # Note: DRY_RUN=1 means Simulation, DRY_RUN=0 means Live
+            current["DRY_RUN"] = "0" if val == "live" else "1"
+            current["MAKER_DRY_RUN"] = "0" if val == "live" else "1"
+        
+        elif ui_key == "risk":
+            # Flatten risk object
+            if isinstance(val, dict):
+                if "maxSlippage" in val:
+                    # Convert float (e.g. 1.0) to BPS string (100)
+                    try:
+                        bps = str(int(float(val["maxSlippage"]) * 100))
+                        current["SLIPPAGE_BPS_BUY"] = bps
+                        current["SLIPPAGE_BPS_SELL"] = bps
+                    except:
+                        pass
+                if "priorityFee" in val:
+                    current["PRIORITY_FEE_MICROLAMPORTS"] = str(val["priorityFee"])
+        
+        elif ui_key in key_map:
+            current[key_map[ui_key]] = str(val)
+        
+        elif isinstance(val, (str, int, float)):
+            # Direct mapping attempt for other keys
+            current[str(ui_key).upper()] = str(val)
+
+    # Write back to file
+    with open(ENV_FILE, "w") as f:
+        for k, v in current.items():
+            f.write(f"{k}={v}\n")
